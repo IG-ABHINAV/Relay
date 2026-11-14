@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay — Endpoint Health</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; background: #f6f7f9; color: #1a1d21; }
+  header { background: #111827; color: #fff; padding: 16px 24px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; color: #9ca3af; font-size: 13px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 24px 40px; }
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 8px; font-size: 16px; }
+  .muted { color: #6b7280; font-size: 13px; }
+  label { font-weight: 600; font-size: 14px; }
+  input[type="password"] { padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; width: min(420px, 100%); font-size: 14px; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; background: #111827; color: #fff; font-size: 14px; cursor: pointer; }
+  button.secondary { background: #e5e7eb; color: #111827; }
+  #banner { display: none; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
+  #banner.error { display: block; background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; }
+  #banner.info { display: block; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }
+  th { color: #6b7280; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th.num { text-align: right; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.healthy { background: #dcfce7; color: #166534; }
+  .pill.failing { background: #fee2e2; color: #991b1b; }
+  .pill.nodata { background: #f3f4f6; color: #374151; }
+  .pill.disabled { background: #fef3c7; color: #92400e; }
+  .url { word-break: break-all; color: #374151; }
+  #lastUpdated { font-size: 13px; color: #6b7280; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Relay — Endpoint Health</h1>
+  <p>Live delivery health for every registered webhook endpoint. Data refreshes every 10 seconds; polling pauses while this tab is hidden.</p>
+</header>
+<main>
+  <div id="banner" role="alert"></div>
+
+  <section class="card" id="keyCard">
+    <h2>API key</h2>
+    <p class="muted">Your Relay API key is sent only to this Relay instance (same origin) and stored in this browser's local storage. It is never sent anywhere else.</p>
+    <label for="apiKey">Relay API key</label><br>
+    <input type="password" id="apiKey" autocomplete="off" placeholder="Paste your Relay API key">
+    <button id="saveKey" type="button">Save key</button>
+    <button id="clearKey" type="button" class="secondary">Clear</button>
+    <span id="keyState" class="muted"></span>
+  </section>
+
+  <section class="card">
+    <h2>Endpoints <span id="lastUpdated"></span></h2>
+    <p class="muted" id="emptyNote" style="display:none">No endpoints registered yet.</p>
+    <table id="healthTable" style="display:none">
+      <thead>
+        <tr>
+          <th>Endpoint</th>
+          <th>Status</th>
+          <th class="num">Success rate (1h)</th>
+          <th class="num">Attempts (1h)</th>
+          <th class="num">Success</th>
+          <th class="num">Failed</th>
+          <th class="num">Consec. failures</th>
+          <th>Last success</th>
+          <th>Last failure</th>
+          <th class="num">p50 / p95 / p99 (ms)</th>
+        </tr>
+      </thead>
+      <tbody id="healthBody"></tbody>
+    </table>
+  </section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var KEY_STORAGE = "relay_api_key";
+  var POLL_MS = 10000;
+
+  var banner = document.getElementById("banner");
+  var apiKeyInput = document.getElementById("apiKey");
+  var keyState = document.getElementById("keyState");
+  var healthTable = document.getElementById("healthTable");
+  var healthBody = document.getElementById("healthBody");
+  var emptyNote = document.getElementById("emptyNote");
+  var lastUpdated = document.getElementById("lastUpdated");
+
+  function getKey() {
+    return (localStorage.getItem(KEY_STORAGE) || "").trim();
+  }
+
+  function showBanner(kind, text) {
+    banner.className = kind;
+    banner.textContent = text;
+  }
+
+  function clearBanner() {
+    banner.className = "";
+    banner.textContent = "";
+  }
+
+  function refreshKeyState() {
+    var hasKey = getKey().length > 0;
+    keyState.textContent = hasKey ? "Key saved in this browser." : "No key saved.";
+    if (hasKey && !apiKeyInput.value) {
+      apiKeyInput.value = getKey();
+    }
+  }
+
+  function fmtTime(value) {
+    if (!value) return "—";
+    var d = new Date(value);
+    return isNaN(d.getTime()) ? "—" : d.toLocaleString();
+  }
+
+  function fmtLatency(p50, p95, p99) {
+    function one(v) { return (v === null || v === undefined) ? "—" : Math.round(v).toString(); }
+    return one(p50) + " / " + one(p95) + " / " + one(p99);
+  }
+
+  function statusFor(endpoint, health) {
+    if (!endpoint.enabled) return ["disabled", "Disabled"];
+    if (!health) return ["nodata", "No data"];
+    if (health.attempts_1h === 0) return ["nodata", "No data"];
+    if (health.consecutive_failures > 0) return ["failing", "Failing"];
+    return ["healthy", "Healthy"];
+  }
+
+  function cell(text, num) {
+    var td = document.createElement("td");
+    if (num) td.className = "num";
+    td.textContent = text;
+    return td;
+  }
+
+  function render(endpoints, healthById) {
+    healthBody.textContent = "";
+    endpoints.forEach(function (ep) {
+      var health = healthById[ep.id];
+      var tr = document.createElement("tr");
+
+      var nameTd = document.createElement("td");
+      var name = document.createElement("strong");
+      name.textContent = ep.name || ep.id;
+      nameTd.appendChild(name);
+      var url = document.createElement("div");
+      url.className = "url";
+      url.textContent = ep.url || "";
+      nameTd.appendChild(url);
+      tr.appendChild(nameTd);
+
+      var status = statusFor(ep, health);
+      var statusTd = document.createElement("td");
+      var pill = document.createElement("span");
+      pill.className = "pill " + status[0];
+      pill.textContent = status[1];
+      statusTd.appendChild(pill);
+      tr.appendChild(statusTd);
+
+      if (!health) {
+        tr.appendChild(cell("—", true));
+        tr.appendChild(cell("—", true));
+        tr.appendChild(cell("—", true));
+        tr.appendChild(cell("—", true));
+        tr.appendChild(cell("—", true));
+        var unavailable = cell("Health unavailable", false);
+        unavailable.colSpan = 3;
+        tr.appendChild(unavailable);
+      } else {
+        tr.appendChild(cell(health.success_rate_1h.toFixed(1) + "%", true));
+        tr.appendChild(cell(String(health.attempts_1h), true));
+        tr.appendChild(cell(String(health.successes_1h), true));
+        tr.appendChild(cell(String(health.failures_1h), true));
+        tr.appendChild(cell(String(health.consecutive_failures), true));
+        tr.appendChild(cell(fmtTime(health.last_success_at), false));
+        tr.appendChild(cell(fmtTime(health.last_failure_at), false));
+        tr.appendChild(cell(fmtLatency(health.p50_latency_ms, health.p95_latency_ms, health.p99_latency_ms), true));
+      }
+
+      healthBody.appendChild(tr);
+    });
+
+    healthTable.style.display = endpoints.length ? "" : "none";
+    emptyNote.style.display = endpoints.length ? "none" : "";
+    lastUpdated.textContent = "— updated " + new Date().toLocaleTimeString();
+  }
+
+  async function api(path, key) {
+    var res = await fetch(path, { headers: { "Authorization": "Bearer " + key } });
+    if (res.status === 401) {
+      var err = new Error("Unauthorized — check your API key.");
+      err.status = 401;
+      throw err;
+    }
+    if (!res.ok) {
+      var err2 = new Error("Request failed: " + res.status + " " + res.statusText);
+      err2.status = res.status;
+      throw err2;
+    }
+    return res.json();
+  }
+
+  async function refresh() {
+    var key = getKey();
+    if (!key) {
+      showBanner("info", "Save your Relay API key above to load endpoint health.");
+      healthTable.style.display = "none";
+      emptyNote.style.display = "none";
+      return;
+    }
+    try {
+      var list = await api("/v1/endpoints", key);
+      var endpoints = list.endpoints || [];
+      var healthById = {};
+      await Promise.all(endpoints.map(async function (ep) {
+        try {
+          healthById[ep.id] = await api("/v1/endpoints/" + encodeURIComponent(ep.id) + "/health", key);
+        } catch (e) {
+          healthById[ep.id] = null;
+        }
+      }));
+      clearBanner();
+      render(endpoints, healthById);
+    } catch (e) {
+      if (e.status === 401) {
+        showBanner("error", "Unauthorized (401) — the saved API key was rejected. Check the key and save it again.");
+      } else {
+        showBanner("error", "Could not reach Relay: " + e.message);
+      }
+    }
+  }
+
+  var timer = null;
+  function startPolling() {
+    if (timer !== null) return;
+    refresh();
+    timer = setInterval(function () {
+      if (!document.hidden) refresh();
+    }, POLL_MS);
+  }
+  function stopPolling() {
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      stopPolling();
+    } else {
+      startPolling();
+    }
+  });
+
+  document.getElementById("saveKey").addEventListener("click", function () {
+    var key = apiKeyInput.value.trim();
+    if (!key) {
+      showBanner("error", "Paste an API key first.");
+      return;
+    }
+    localStorage.setItem(KEY_STORAGE, key);
+    refreshKeyState();
+    clearBanner();
+    refresh();
+  });
+
+  document.getElementById("clearKey").addEventListener("click", function () {
+    localStorage.removeItem(KEY_STORAGE);
+    apiKeyInput.value = "";
+    refreshKeyState();
+    showBanner("info", "API key cleared. Save a key above to load endpoint health.");
+  });
+
+  refreshKeyState();
+  startPolling();
+})();
+</script>
+</body>
+</html>

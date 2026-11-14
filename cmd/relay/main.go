@@ -27,6 +27,10 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger"
 )
 
+// version is the build version reported by GET /v1/health. Release builds
+// set it with -ldflags "-X main.version=<version>".
+var version = "dev"
+
 // @title Relay API
 // @version 1.0
 // @description Reliable webhook delivery infrastructure.
@@ -110,11 +114,7 @@ func main() {
 		deliveriesCollection,
 		attemptsCollection,
 		aggregator,
-		delivery.Config{
-			Logger:         slog.Default(),
-			Concurrency:    cfg.WorkerConcurrency,
-			RequestTimeout: 10 * time.Second,
-		},
+		workerDeliveryConfig(cfg),
 	)
 
 	// Register HTTP handlers.
@@ -123,7 +123,9 @@ func main() {
 	mux.HandleFunc("/swagger/", httpSwagger.WrapHandler)
 
 	healthHandler := handlers.NewHealthHandler(client).
-		WithIndexChecker(database.NewIndexChecker(db))
+		WithIndexChecker(database.NewIndexChecker(db)).
+		WithWorker(worker, workerDeliveryConfig(cfg).PollInterval).
+		WithVersion(version)
 	healthHandler.Register(mux)
 
 	fanout := delivery.NewFanout(
@@ -178,6 +180,9 @@ func main() {
 	)
 	endpointHealthHandler.Register(mux)
 
+	dashboardHandler := handlers.NewDashboardHandler()
+	dashboardHandler.Register(mux)
+
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           mux,
@@ -216,6 +221,20 @@ func main() {
 	}
 
 	slog.Info("shutdown complete")
+}
+
+// workerDeliveryConfig maps the environment-backed configuration onto
+// the delivery worker. PollInterval must be a positive duration and
+// LeaseDuration must exceed RequestTimeout, otherwise the worker's
+// config validation rejects it and no deliveries are ever polled.
+func workerDeliveryConfig(cfg config.Config) delivery.Config {
+	return delivery.Config{
+		Logger:         slog.Default(),
+		Concurrency:    cfg.WorkerConcurrency,
+		RequestTimeout: 10 * time.Second,
+		PollInterval:   time.Duration(cfg.WorkerPollSeconds) * time.Second,
+		LeaseDuration:  30 * time.Second,
+	}
 }
 
 // reconcilerFanoutAdapter bridges the Reconciler's interface to the existing Fanout object.
